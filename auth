@@ -1,0 +1,572 @@
+# Analiza autoryzacji i identyfikacji użytkowników w aplikacjach kontenerowych on-premise (Angular + .NET Core Web API → ASP.NET Core MVC)
+
+Jesteś doświadczonym architektem oprogramowania specjalizującym się w bezpieczeństwie, autoryzacji i wdrożeniach kontenerowych w środowisku on-premise. Twoim zadaniem jest:
+
+1. **Przeanalizować** jak istniejąca aplikacja Angular + .NET Core Web API (działająca w kontenerze on-premise) realizuje autoryzację, uwierzytelnianie i pozyskiwanie danych użytkownika (login, imię, nazwisko, email, role, grupy AD itp.) — ze szczególnym uwzględnieniem wszelkich firmowych / wewnętrznych bibliotek autoryzacyjnych
+2. **Zrozumieć** co dokładnie robi biblioteka firmowa (jeśli istnieje) — jakie dane użytkownika dostarcza, jak się integruje, skąd pobiera dane (Active Directory / LDAP / header-based / token / firmowy IdP), jakie wystawia API/interfejsy
+3. **Zaprojektować** analogiczne rozwiązanie autoryzacji i pozyskiwania danych użytkownika dla aplikacji ASP.NET Core MVC (również w kontenerze on-premise) — z wykorzystaniem tej samej biblioteki firmowej LUB jej odpowiednika
+4. **Zapewnić** że obie aplikacje kontenerowe mogą niezawodnie identyfikować użytkownika i pobierać pełne dane profilu w środowisku on-premise
+
+Zanim zaczniemy, zapoznaj się z poniższymi informacjami:
+
+## Kontekst
+
+<context>
+- Środowisko: ON-PREMISE — brak chmury (brak Azure / AWS / GCP)
+- Obie aplikacje działają w kontenerach Docker (Linux) w lokalnej infrastrukturze
+- Aplikacja źródłowa (do analizy): Angular (frontend) + .NET Core Web API (backend)
+- Aplikacja docelowa (do zaprojektowania): ASP.NET Core MVC (server-side rendering, Razor Views)
+- Środowisko korporacyjne — użytkownicy w Active Directory (on-premise AD DS)
+- Kontener NIE jest przyłączony do domeny Windows
+- Prawdopodobnie używana jest firmowa / wewnętrzna biblioteka autoryzacyjna — abstrakcja nad mechanizmem auth
+- Identity Provider: on-premise (ADFS / Keycloak / IdentityServer / firmowy IdP / brak — bezpośredni AD)
+- Potrzebne dane użytkownika: login (username/UPN), imię, nazwisko, email, rola/grupa, department — pełny profil
+</context>
+
+## Aplikacja źródłowa — Angular + .NET Core Web API (do analizy)
+
+<source_application>
+- Frontend: Angular (SPA)
+- Backend: .NET Core Web API
+- Hosting: Kontener Docker (Linux), on-premise
+- Biblioteka auth: {{authLibrary}} <- firmowa / wewnętrzna biblioteka — ZBADAĆ (przeszukaj .csproj, packages.config, Program.cs)
+- Reverse proxy: {{reverseProxy}} <- np. nginx, Traefik, HAProxy, IIS ARR, Apache, inne
+- Autentykacja: DO USTALENIA W ANALIZIE — może być:
+  - OAuth2/OIDC via on-premise IdP (ADFS / Keycloak / IdentityServer) z biblioteką firmową jako wrapper
+  - Header-based auth (reverse proxy wstrzykuje headery X-User, X-Roles po auth np. Kerberos)
+  - JWT tokens (biblioteka firmowa waliduje i wyciąga claims)
+  - Windows Auth via reverse proxy (Kerberos/NTLM → header forwarding do kontenera)
+  - LDAP/AD bind bezpośrednio z aplikacji (forms login → weryfikacja credentials w AD)
+  - Custom token issued by firmowy Identity Provider on-premise
+  - Kombinacja powyższych
+</source_application>
+
+Pliki źródłowe Angular — frontend:
+<angular_files>
+{{angularAuthService}} <- np. auth.service.ts, login.component.ts, auth.guard.ts
+{{angularAuthInterceptor}} <- interceptor HTTP (dodaje token/cookie/header do requestów API)
+{{angularAuthConfig}} <- konfiguracja auth: app.module.ts, environment.ts, auth-config.ts
+{{angularUserModel}} <- model użytkownika: user.model.ts, user-profile.model.ts
+{{angularPackageJson}} <- package.json — SZUKAJ zależności: oidc-client, angular-auth-oidc-client, @auth0/*, firmowe pakiety npm (np. @firma/auth, @internal/*)
+</angular_files>
+
+Pliki źródłowe .NET Core Web API — backend:
+<webapi_files>
+{{programCs}} <- Program.cs / Startup.cs — KLUCZOWE: konfiguracja auth middleware, rejestracja biblioteki firmowej
+{{appsettingsJson}} <- appsettings.json — sekcje: Authentication, JWT, LDAP, ActiveDirectory, FirmowaAuth, itp.
+{{authControllers}} <- kontrolery auth: AccountController, AuthController, UserController, ProfileController
+{{authServices}} <- serwisy: UserService, AuthService, ActiveDirectoryService, LdapService, ProfileService
+{{authModels}} <- modele: UserDto, UserProfile, UserClaims, CurrentUser
+{{authMiddleware}} <- custom middleware (jeśli istnieje)
+{{csprojFile}} <- .csproj — SZUKAJ PackageReference do firmowej biblioteki (niestandardowe pakiety — nie Microsoft.* / System.*)
+{{packagesConfig}} <- packages.config (jeśli istnieje)
+{{dockerfileApi}} <- Dockerfile Web API
+{{dockerCompose}} <- docker-compose.yml
+</webapi_files>
+
+Firmowa biblioteka autoryzacyjna (KRYTYCZNE):
+<auth_library>
+{{authLibraryPackage}} <- NuGet package firmowej biblioteki (niestandardowe pakiety znalezione w .csproj)
+{{authLibraryDll}} <- DLL biblioteki (jeśli nie przez NuGet, a jako lokalna referencja)
+{{authLibraryDocs}} <- dokumentacja biblioteki (README, wiki, confluence, itp.) — jeśli dostępna
+{{authLibraryConfig}} <- konfiguracja biblioteki w appsettings.json
+{{authLibraryUsageExamples}} <- przykłady użycia w kodzie (jak jest wywoływana w kontrolerach/serwisach)
+{{authLibraryInterfaces}} <- interfejsy wystawiane przez bibliotekę (np. ICurrentUser, IUserProvider, IAuthService)
+{{authLibraryNugetSource}} <- źródło NuGet (firmowy feed, jeśli dotyczy)
+</auth_library>
+
+Konfiguracja infrastruktury:
+<infrastructure>
+{{reverseProxyConfig}} <- konfiguracja reverse proxy (nginx.conf, traefik.yml, httpd.conf, itp.) — SZUKAJ: forwarded headers, auth headers, proxy_set_header, Kerberos negotiate
+{{k8sManifests}} <- Kubernetes manifests / Docker Compose (jeśli dotyczy)
+{{networkConfig}} <- konfiguracja sieci kontenerów (dostęp do AD/LDAP, DNS)
+{{identityProviderConfig}} <- konfiguracja on-premise Identity Provider (ADFS relying party, Keycloak realm, IdentityServer clients, itp.)
+{{adConfig}} <- konfiguracja Active Directory (domena, DC, OU, grupy) — jeśli dostępna
+</infrastructure>
+
+## Aplikacja docelowa — ASP.NET Core MVC (do zaprojektowania)
+
+<target_application>
+- Framework: ASP.NET Core MVC (.NET 9.0)
+- Wzorzec: Server-side rendering (Razor Views) — NIE SPA
+- Hosting: Kontener Docker (Linux), on-premise
+- Charakter: {{appCharacter}} <- np. konwerter XML→PDF, panel administracyjny, inne
+- Cel: Zastosować TEN SAM mechanizm autoryzacji co w Angular + Web API (tę samą bibliotekę firmową lub ten sam IdP)
+- Wymagane dane użytkownika w aplikacji MVC:
+  - Login (username / sAMAccountName / UPN) — np. "jkowalski" lub "jkowalski@firma.local"
+  - Imię (givenName) — np. "Jan"
+  - Nazwisko (surname) — np. "Kowalski"
+  - Pełne imię i nazwisko (displayName) — np. "Jan Kowalski"
+  - Email — np. "jan.kowalski@firma.pl"
+  - Rola / Grupa AD — np. "Admin", "Operator", "Viewer"
+  - Department / oddział — np. "IT", "HR"
+  - Inne: {{additionalUserData}}
+- Gdzie dane użytkownika są potrzebne w MVC:
+  - Wyświetlanie w layout: "Zalogowany jako: Jan Kowalski (jkowalski)"
+  - Autoryzacja widoków i akcji (rola → dostęp do funkcji)
+  - Audit log: kto wykonał operację (np. kto wygenerował PDF)
+  - Watermark / metadane w generowanych dokumentach
+  - Filtrowanie danych na podstawie działu/roli
+  - Inne: {{additionalUseCases}}
+</target_application>
+
+Pliki docelowe MVC (jeśli już istnieją):
+<target_files>
+{{mvcProgramCs}} <- Program.cs
+{{mvcControllers}} <- istniejące kontrolery
+{{mvcViews}} <- istniejące widoki
+{{mvcDockerfile}} <- Dockerfile
+{{mvcCsproj}} <- .csproj
+</target_files>
+
+
+## Instrukcje analizy
+Przed dostarczeniem ostatecznego planu użyj znaczników `<analysis>`, aby przeprowadzić dogłębną analizę.
+
+### FAZA 1: Reverse engineering — jak działa auth w Angular + Web API
+
+1. **Identyfikacja firmowej biblioteki autoryzacyjnej**:
+   - Przeszukaj `.csproj` / `packages.config` Web API — znajdź WSZYSTKIE pakiety NuGet, które nie są standardowymi Microsoft.* / System.*. Szczególnie szukaj:
+     - Niestandardowe nazwy pakietów (firmowe, wewnętrzne)
+     - Pakiety z firmowego NuGet feed (nie nuget.org)
+     - Lokalne referencje DLL (`<Reference>` z `HintPath`)
+   - Przeszukaj `package.json` Angulara — znajdź niestandardowe pakiety npm (np. `@firma/*`, `@internal/*`, scoped packages)
+   - Przeszukaj `Program.cs` / `Startup.cs` — znajdź rejestracje auth:
+     - Custom extension methods (np. `services.AddFirmaAuth()`, `app.UseFirmaAuth()`) — KAŻDE niestandardowe `Add*()` / `Use*()`
+     - `services.AddAuthentication()` — jakie scheme? Bearer? Cookies? Negotiate? Custom?
+     - `services.AddAuthorization()` — jakie policy? Jakie role?
+   - Przeszukaj kontrolery — jak pobierają dane użytkownika:
+     - `User.Identity.Name` — skąd pochodzi?
+     - `User.Claims` — jakie claims są dostępne?
+     - Custom interfejsy: `ICurrentUser`, `IUserContext`, `IUserProvider` — wstrzykiwane przez DI?
+     - `HttpContext.Items["User"]` — custom middleware?
+     - `[Authorize(Roles = "...")]`, `[Authorize(Policy = "...")]` — jakie atrybuty?
+   - Zidentyfikuj INTERFEJSY wystawiane przez bibliotekę:
+     - Jakie properties ma obiekt użytkownika (Login, Name, Email, Roles, Department, ...)?
+     - Jak jest zarejestrowany w DI (Scoped/Transient/Singleton)?
+
+2. **Pełny flow autentykacji — od przeglądarki do danych użytkownika**:
+
+   Prześledź CAŁY łańcuch i udokumentuj KAŻDY krok:
+
+   ```
+   [Przeglądarka] → [Reverse Proxy on-prem] → [Angular SPA] → [Web API w kontenerze]
+        ↓                    ↓                       ↓                    ↓
+   Kto autentykuje?    Co robi proxy?          Jak Angular         Jak backend
+   (redirect do        (Kerberos negotiate?    wie kim jest        waliduje i
+   ADFS? Keycloak?     forwarded headers?      user? Skąd          pobiera dane
+   forms login?        auth header injection?  bierze token?       użytkownika?
+   SSO silent?)        passthrough?)           Cookie? JWT?)       Biblioteka firmowa?)
+   ```
+
+   Konkretnie ustal:
+   - **Krok 1 — Punkt wejścia**: Czy użytkownik jest przekierowywany na stronę logowania (ADFS / Keycloak / IdentityServer / custom login page)? Czy jest SSO (Windows Integrated Auth via proxy)? Czy jest forms login w samej aplikacji?
+   - **Krok 2 — Token / credential**: Co jest wynikiem autentykacji? JWT token? Cookie? Header wstrzyknięty przez proxy (np. `X-Remote-User` po Kerberos negotiate)? SAML assertion?
+   - **Krok 3 — Angular**: Jak Angular przechowuje credential (localStorage, sessionStorage, cookie, memory)? Jak dodaje do requestów API (Authorization: Bearer, cookie, custom header)?
+   - **Krok 4 — Web API**: Jak backend odbiera i waliduje credential? Middleware? Biblioteka firmowa? Jakie claims/dane są dostępne po walidacji?
+   - **Krok 5 — Dane użytkownika**: Skąd backend POBIERA pełne dane użytkownika (login, imię, nazwisko, email, role, department)?
+     - Z token claims (JWT decode)?
+     - Z AD/LDAP query bezpośrednio (biblioteka firmowa łączy się z AD przez LDAP na podstawie loginu)?
+     - Z firmowego User API on-premise?
+     - Z headera wstrzykniętego przez reverse proxy?
+     - Z cache (biblioteka cachuje profil po pierwszym pobraniu)?
+
+3. **Analiza danych użytkownika — co jest dostępne i skąd**:
+
+   Stwórz mapę:
+   | Dane | Źródło | Jak pobierane | Dostępne w kodzie jako |
+   |---|---|---|---|
+   | Login (sAMAccountName) | ? (token claim / AD/LDAP query / header) | ? | `User.Identity.Name` / `ICurrentUser.Login` / ? |
+   | UPN | ? | ? | ? |
+   | Imię (givenName) | ? | ? | ? |
+   | Nazwisko (surname) | ? | ? | ? |
+   | DisplayName | ? | ? | ? |
+   | Email | ? | ? | ? |
+   | Role / Grupy AD | ? | ? | ? |
+   | Department | ? | ? | ? |
+
+4. **Analiza biblioteki firmowej**:
+
+   Dla KAŻDEGO znalezionego komponentu biblioteki ustal:
+
+   **a) Pakiety NuGet / DLL:**
+   | Pakiet/DLL | Wersja | Do czego służy | Target Framework | Kompatybilny z .NET 9? |
+   |---|---|---|---|---|
+   | [nazwa] | ? | ? | ? | ? |
+
+   **b) Interfejsy / API biblioteki:**
+   - Jakie interfejsy wystawia? (`ICurrentUser`, `IUserProvider`, `IAuthService`, ...)
+   - Jakie extension methods rejestrują w DI? (`AddFirmaAuth()`, `UseFirmaAuth()`, ...)
+   - Jakie middleware dodaje do pipeline?
+   - Jakie opcje konfiguracyjne przyjmuje? (sekcja w appsettings.json)
+
+   **c) Zależności biblioteki:**
+   - Czy wymaga połączenia z AD/LDAP? (port 389/636 z kontenera do DC on-premise)
+   - Czy komunikuje się z firmowym Identity Provider on-premise (ADFS / Keycloak / IdentityServer)?
+   - Czy wymaga Windows-specific komponentów? (BLOKER na Linux kontenerze)
+   - Czy wymaga Kerberos keytab / SPNEGO? (wymaga konfiguracji krb5 w kontenerze)
+
+   **d) Kompatybilność z MVC:**
+   - Czy biblioteka jest zaprojektowana tylko dla Web API (Bearer/JWT), czy też wspiera MVC (cookie auth, server-side redirect)?
+   - Czy jest wersja/wariant dla aplikacji MVC (nie SPA)?
+   - Jeśli biblioteka jest API-only (JWT/Bearer) — jak zaadaptować dla MVC (cookie-based flow)?
+
+5. **Analiza reverse proxy — co robi z auth**:
+   - Czy reverse proxy terminuje auth (np. Kerberos negotiate → wstrzykuje X-Forwarded-User / X-Remote-User header)?
+   - Czy proxy tylko forwarduje (passthrough) — auth jest w aplikacji?
+   - Jakie headery są forwardowane? (`X-Forwarded-For`, `X-Forwarded-User`, `X-Remote-User`, `X-Forwarded-Groups`, custom)
+   - Czy MVC app będzie za TYM SAMYM reverse proxy?
+
+6. **Analiza Docker / kontener — aspekty auth w on-premise**:
+   - Jak kontener Web API jest skonfigurowany pod auth (env vars, secrets, certyfikaty)?
+   - Czy jest network connectivity z kontenera do:
+     - Domain Controller / AD DS (LDAP port 389/636)?
+     - DNS serwera domenowego (resolving DC)?
+     - On-premise Identity Provider (ADFS / Keycloak / IdentityServer — HTTPS)?
+   - Czy są zamontowane certyfikaty CA firmy (self-signed root CA)?
+   - Czy jest skonfigurowany Kerberos w kontenerze (krb5.conf, keytab)?
+   - Jakie env vars / Docker secrets są przekazywane (LDAP connection string, service account credentials, IdP endpoints)?
+
+### FAZA 2: Projekt rozwiązania auth dla ASP.NET Core MVC
+
+7. **Wybór strategii auth dla MVC w kontenerze on-premise**:
+
+   Na podstawie analizy z Fazy 1, wybierz JEDNĄ strategię i uzasadnij:
+
+   **Opcja A: Ta sama biblioteka firmowa**
+   - Warunek: biblioteka wspiera .NET 9 + MVC (cookie auth / server-side flow)
+   - Zaleta: spójność z istniejącą aplikacją, ten sam mechanizm
+   - Ryzyko: biblioteka może nie wspierać MVC flow (tylko API/Bearer)
+
+   **Opcja B: OAuth2/OIDC via on-premise IdP (ADFS / Keycloak / IdentityServer)**
+   - Warunek: istnieje on-premise Identity Provider wspierający OIDC
+   - MVC jako OIDC Client → redirect do IdP → callback → cookie session
+   - `services.AddAuthentication().AddOpenIdConnect()` + `AddCookie()`
+   - Claims z tokena OIDC + opcjonalnie LDAP query dla dodatkowych danych
+   - Standardowe, dobrze udokumentowane
+
+   **Opcja C: Header-based auth (reverse proxy autentykuje)**
+   - Warunek: reverse proxy wstrzykuje headery z danymi użytkownika (np. po Kerberos negotiate)
+   - MVC czyta headery (`X-Forwarded-User`, `X-Remote-User`, custom)
+   - Custom middleware tworzy `ClaimsPrincipal` z headerów
+   - Proste, ale wymaga zaufanego proxy (NIEBEZPIECZNE bez proxy!)
+   - Dane użytkownika: headery + uzupełnienie z AD/LDAP
+
+   **Opcja D: LDAP/AD bind bezpośrednio (forms login)**
+   - MVC ma własny formularz logowania
+   - Credentials walidowane bezpośrednio w AD przez LDAP bind
+   - `System.DirectoryServices.Protocols` (kompatybilny z Linux) lub `Novell.Directory.Ldap.NETStandard`
+   - Po auth: pobranie danych użytkownika z AD (givenName, sn, mail, memberOf, department)
+   - Cookie session w MVC
+   - Niezależne od IdP, ale wymaga LDAP connectivity z kontenera
+
+   **Opcja E: Hybrid — biblioteka firmowa + fallback na OIDC / LDAP**
+   - Próba użycia biblioteki firmowej
+   - Jeśli nie wspiera MVC → OIDC lub LDAP jako alternatywa
+   - Adapter: wrapper nad biblioteką firmową implementujący standardowy ASP.NET Core auth
+
+8. **Projekt pozyskiwania danych użytkownika w MVC**:
+
+   Zaprojektuj jak MVC app będzie miała dostęp do PEŁNYCH danych użytkownika:
+
+   **a) Interfejs `ICurrentUser` (lub analogiczny):**
+   ```csharp
+   public interface ICurrentUser
+   {
+       string Login { get; }           // sAMAccountName / UPN
+       string FirstName { get; }       // imię (z AD: givenName)
+       string LastName { get; }        // nazwisko (z AD: sn)
+       string DisplayName { get; }     // pełne imię i nazwisko (z AD: displayName)
+       string Email { get; }           // email (z AD: mail)
+       IReadOnlyList<string> Roles { get; }  // role / grupy AD (z AD: memberOf)
+       string Department { get; }      // dział (z AD: department)
+   }
+   ```
+
+   **b) Źródło danych — skąd MVC pobierze te dane w środowisku on-premise?**
+   - Z claims tokena OIDC (jeśli on-premise IdP zwraca te claims)?
+   - Z AD/LDAP query bezpośrednio (po zalogowaniu — pobierz profil z AD)?
+   - Z firmowego User API on-premise (jeśli istnieje serwis profilów)?
+   - Z biblioteki firmowej (jeśli ma tę funkcjonalność)?
+   - Z headerów reverse proxy (jeśli proxy enrichuje headery danymi z AD)?
+   - Caching — jak długo trzymać dane? Per-session? Per-request? Memory cache z TTL?
+
+   **c) LDAP query do AD (jeśli potrzebne):**
+   ```
+   DC connectivity: ldap://dc01.firma.local:389 lub ldaps://dc01.firma.local:636
+   Service account: svc_app@firma.local (do bind i query)
+   Search base: DC=firma,DC=local
+   Filter: (&(objectClass=user)(sAMAccountName={login}))
+   Attributes: givenName, sn, displayName, mail, memberOf, department, userPrincipalName
+   ```
+
+   **d) Rejestracja w DI:**
+   - `ICurrentUser` jako Scoped (per-request)
+   - Provider/Factory pattern — tworzy `CurrentUser` na podstawie `HttpContext.User` + dane z AD/cache
+
+9. **Projekt middleware / pipeline auth w MVC**:
+
+   ```
+   Program.cs pipeline:
+
+   app.UseForwardedHeaders();          // obsługa headerów od reverse proxy on-prem
+   app.UseAuthentication();            // autentykacja (OIDC / Cookie / LDAP / Custom)
+   app.UseAuthorization();             // autoryzacja (role / policy)
+   // custom middleware: hydrate ICurrentUser z claims + dodatkowe dane z AD/LDAP
+   ```
+
+10. **Projekt dostępu do danych użytkownika w widokach Razor**:
+
+    - `_Layout.cshtml` — wyświetlanie nazwy zalogowanego użytkownika
+    - `ViewComponent` lub `Partial View` — komponent "User Info" w nawigacji
+    - `@inject ICurrentUser CurrentUser` w widokach — bezpośredni dostęp
+    - `User.Identity.Name` / `User.Claims` — standardowy dostęp przez ClaimsPrincipal
+    - Tag Helpers autoryzacyjne: `<authorize role="Admin">...</authorize>`
+
+11. **Projekt autoryzacji w kontrolerach MVC**:
+
+    - `[Authorize]` — wymaga zalogowanego użytkownika
+    - `[Authorize(Roles = "Admin")]` — wymaga roli (mapowanej z grupy AD)
+    - `[Authorize(Policy = "CanGeneratePdf")]` — policy-based
+    - Custom `IAuthorizationHandler` — jeśli logika autoryzacji jest złożona
+    - `ICurrentUser` w kontrolerze — dostęp do danych użytkownika w akcjach
+
+### FAZA 3: Konteneryzacja auth on-premise
+
+12. **Dockerfile dla MVC z auth on-premise**:
+    - Dodatkowe pakiety systemowe w kontenerze:
+      - `ca-certificates` + firmowe certyfikaty CA (self-signed root CA firmy)
+      - `krb5-user` + `krb5.conf` (jeśli Kerberos auth)
+      - `ldap-utils` / `libldap` (jeśli LDAP query z kontenera)
+    - Env vars / secrets: LDAP connection string, service account, IdP endpoints
+    - DNS: kontener musi resolwować nazwy DC (np. `dc01.firma.local`) — custom DNS w Docker network
+
+13. **Konfiguracja kontenerowa auth on-premise**:
+    - Environment variables dla auth (NIE w appsettings.json w WARSTWIE obrazu!)
+    - Docker secrets dla wrażliwych danych (service account password, LDAP bind password)
+    - Network connectivity z kontenera:
+      - → Domain Controller / AD DS: LDAP (389) / LDAPS (636) / Kerberos (88)
+      - → DNS serwera domenowego: DNS (53)
+      - → On-premise Identity Provider: HTTPS (443)
+    - DNS configuration: `--dns` flag w Docker run lub DNS w Docker network / custom `resolv.conf`
+    - Firmowe certyfikaty CA: COPY do `/usr/local/share/ca-certificates/` + `update-ca-certificates` w Dockerfile
+    - Health check z uwzględnieniem auth (czy endpoint /health wymaga auth?)
+
+14. **Spójność auth między Angular+API a MVC (on-premise)**:
+    - Czy użytkownik zalogowany w Angular app jest automatycznie zalogowany w MVC app? (SSO via wspólny IdP / Kerberos)
+    - Czy obie aplikacje używają tego samego on-premise IdP?
+    - Czy obie są za tym samym reverse proxy?
+    - Cookie domain — jeśli obie na tej samej domenie (np. *.firma.local), shared cookie?
+    - Czy trzeba osobnej konfiguracji (relying party / client) w IdP dla MVC app?
+
+## Format wyjściowy
+
+Po przeprowadzeniu analizy utwórz szczegółowy plan w formacie markdown:
+
+```markdown
+# Plan autoryzacji i identyfikacji użytkowników: [Nazwa Aplikacji MVC]
+
+## 1. Przegląd
+
+[Cel: zapewnienie autoryzacji i identyfikacji użytkowników w MVC app w kontenerze on-premise]
+[Jak to działa w obecnej Angular + API app — podsumowanie]
+[Wybrane podejście dla MVC — z uzasadnieniem]
+
+## 2. Analiza obecnego rozwiązania (Angular + Web API)
+
+### 2.1 Biblioteka firmowa
+[Nazwa, wersja, pakiety NuGet / DLL]
+[Co robi — opis funkcjonalności]
+[Jakie interfejsy wystawia]
+[Jak jest zarejestrowana w DI]
+[Jak jest skonfigurowana (appsettings)]
+[Kompatybilność z .NET 9 / MVC / Linux kontener]
+
+### 2.2 Flow autentykacji
+[Pełny flow: przeglądarka → proxy on-prem → Angular → API → dane użytkownika]
+[Diagram sekwencji]
+
+### 2.3 Flow pozyskiwania danych użytkownika
+[Skąd pochodzą dane: token claims / AD/LDAP query / headery proxy / firmowe API]
+[Mapa danych: jakie dane, skąd, jak dostępne w kodzie]
+
+### 2.4 Konfiguracja infrastruktury auth on-premise
+[Reverse proxy — rola w auth]
+[Identity Provider on-premise — konfiguracja]
+[AD/LDAP — connectivity, service account]
+[Network — connectivity requirements (porty, DNS)]
+
+## 3. Projekt rozwiązania auth dla MVC
+
+### 3.1 Wybrana strategia
+[Opcja A/B/C/D/E — z uzasadnieniem]
+[Dlaczego ta, a nie inna]
+
+### 3.2 Konfiguracja autentykacji (Program.cs)
+[Kod konfiguracji auth middleware]
+[Rejestracja serwisów auth]
+[Options pattern — klasy konfiguracyjne]
+
+### 3.3 Interfejs ICurrentUser
+[Definicja interfejsu]
+[Implementacja — skąd pobiera dane (AD/LDAP / claims / headers)]
+[Rejestracja w DI (Scoped)]
+[Caching strategia]
+
+### 3.4 Pozyskiwanie danych użytkownika
+[Źródło danych (claims / AD/LDAP query / firmowe API / headery)]
+[LDAP query: connection string, search base, filter, attributes]
+[Service account do LDAP bind]
+[Moment pobrania (middleware / lazy loading / per-request)]
+[Cache (memory cache / distributed cache / TTL)]
+[Fallback — co jeśli AD/LDAP niedostępne?]
+
+### 3.5 Autoryzacja
+[Mapowanie grup AD → role aplikacji]
+[Role-based / Policy-based / Claims-based]
+[Atrybuty na kontrolerach]
+[Konfiguracja policy w Program.cs]
+
+## 4. Integracja z biblioteką firmową
+
+### 4.1 Czy biblioteka jest kompatybilna?
+[Analiza kompatybilności z .NET 9 / MVC / Linux]
+[Jeśli TAK — jak użyć w MVC]
+[Jeśli NIE — jaki zamiennik / adapter]
+
+### 4.2 Konfiguracja biblioteki
+[appsettings.json — sekcja auth]
+[Environment variables]
+[Extension methods rejestracji]
+
+### 4.3 Adapter (jeśli potrzebny)
+[Wrapper nad biblioteką firmową]
+[Adapter ICurrentUser → biblioteka firmowa]
+[Fallback jeśli biblioteka nie wspiera MVC flow]
+
+## 5. Dane użytkownika w widokach Razor
+
+### 5.1 Layout — wyświetlanie zalogowanego użytkownika
+[_Layout.cshtml — sekcja user info]
+[ViewComponent / Partial View]
+
+### 5.2 Dostęp do danych w widokach
+[@inject ICurrentUser]
+[Tag Helpers autoryzacyjne]
+
+### 5.3 Dostęp do danych w kontrolerach
+[Wstrzykiwanie ICurrentUser]
+[Audit logging — kto co zrobił]
+[Przekazywanie do serwisów (np. generowanie PDF z danymi użytkownika)]
+
+## 6. Konteneryzacja auth on-premise
+
+### 6.1 Dockerfile
+[Dodatkowe pakiety (ca-certificates, krb5-user, ldap-utils)]
+[Firmowe certyfikaty CA — COPY + update-ca-certificates]
+[Konfiguracja env vars]
+
+### 6.2 Docker Compose / Kubernetes
+[Environment variables / secrets]
+[Network connectivity: kontener → DC (LDAP 389/636), DNS (53), IdP (443)]
+[DNS configuration (resolving firma.local)]
+[Health checks]
+
+### 6.3 Konfiguracja reverse proxy
+[Czy MVC app jest za tym samym proxy co Angular + API?]
+[Forwarded headers middleware]
+[Trusted proxies configuration]
+
+## 7. SSO i spójność między aplikacjami
+
+[Czy user zalogowany w Angular app jest zalogowany w MVC?]
+[Wspólny on-premise IdP → SSO]
+[Kerberos SSO via reverse proxy]
+[Cookie domain (jeśli ta sama domena)]
+[Konfiguracja w IdP — osobny client/relying party dla MVC?]
+
+## 8. Bezpieczeństwo
+
+[HTTPS enforcement (nawet on-premise!)]
+[Cookie security (HttpOnly, Secure, SameSite)]
+[CSRF / AntiForgeryToken]
+[Forwarded headers — trust only known on-premise proxies (IP whitelist)]
+[Nie ufaj headerom auth bez reverse proxy!]
+[LDAP connection security (LDAPS / StartTLS)]
+[Service account — principle of least privilege]
+[Token/cookie expiration i refresh]
+[Logout — session cleanup, IdP logout (jeśli OIDC), cookie cleanup]
+
+## 9. Obsługa błędów auth
+
+| Scenariusz | HTTP Code | Zachowanie | UX |
+|---|---|---|---|
+| Niezalogowany użytkownik | 401 → redirect | Redirect do IdP / strony logowania | Automatyczne |
+| Brak uprawnień (rola/grupa AD) | 403 | Strona "Access Denied" | Komunikat |
+| Token/cookie wygasł | 401 → redirect | Re-auth / refresh | Automatyczne |
+| On-premise IdP niedostępny | 503 | Strona błędu + retry | Komunikat |
+| AD/LDAP niedostępne | 500 | Fallback na minimalne dane z claims / cache | Logowanie błędu |
+| Biblioteka firmowa error | 500 | Fallback / error page | Logowanie + komunikat |
+| Service account zablokowany/expired | 500 | Alert ops + error page | Komunikat |
+| DNS nie resolwuje DC | 500 | Error page + log | Komunikat |
+
+## 10. Kroki implementacji
+
+### Etap 0: Analiza i PoC
+1. [Zbadanie biblioteki firmowej — interfejsy, kompatybilność z MVC/.NET 9/Linux]
+2. [Zbadanie connectivity: kontener → AD/LDAP, kontener �� IdP, DNS resolving]
+3. [PoC: uruchomienie auth w MVC w kontenerze on-premise]
+4. [PoC: pobranie pełnych danych użytkownika z AD/LDAP z kontenera]
+5. [DECYZJA: biblioteka firmowa vs OIDC vs LDAP direct vs header-based]
+
+### Etap 1: Implementacja auth
+6. [Konfiguracja auth w Program.cs]
+7. [Implementacja ICurrentUser + provider (z AD/LDAP query)]
+8. [Implementacja cache danych użytkownika]
+9. [Konfiguracja autoryzacji (mapowanie grup AD → role, policy)]
+
+### Etap 2: Integracja z UI
+10. [Layout — wyświetlanie danych użytkownika]
+11. [Autoryzacja w widokach i kontrolerach]
+12. [Audit logging z danymi użytkownika]
+
+### Etap 3: Konteneryzacja
+13. [Dockerfile — ca-certificates, krb5, ldap, DNS]
+14. [Docker Compose / K8s — secrets, network, DNS]
+15. [Reverse proxy configuration]
+16. [Health checks]
+
+### Etap 4: Testy
+17. [Test auth flow end-to-end w kontenerze on-premise]
+18. [Test pobrania danych użytkownika z AD]
+19. [Test autoryzacji (różne grupy AD / role)]
+20. [Test SSO z Angular app]
+21. [Test edge cases (AD down, IdP down, service account expired, DNS failure)]
+```
+
+## Zasady ogólne
+
+W całym planie upewnij się, że:
+
+- **Środowisko on-premise** — brak chmury. Wszystkie rozwiązania muszą działać w lokalnej infrastrukturze. NIE proponuj Azure AD / Entra ID / Graph API / Azure App Registration. Zamiast tego: on-premise AD DS, ADFS, Keycloak, IdentityServer, LDAP, Kerberos.
+- **Biblioteka firmowa jest punktem wyjścia** — najpierw zbadaj co robi i czy da się użyć w MVC. Dopiero jeśli nie — proponuj alternatywę.
+- **Kontener Linux jest ograniczeniem** — Windows Auth (NTLM/Kerberos bezpośrednio) nie działa w kontenerze Linux bez specjalnej konfiguracji (krb5.conf, keytab). Uwzględnij to.
+- **Connectivity on-premise** — kontener musi mieć dostęp sieciowy do DC (LDAP), DNS domenowego, IdP. Zaplanuj konfigurację sieci Docker.
+- **Firmowe certyfikaty CA** — on-premise IdP / LDAPS prawdopodobnie używa certyfikatów wystawionych przez wewnętrzne CA. Kontener musi im ufać (ca-certificates).
+- **Service account** — do LDAP query potrzebne jest konto serwisowe w AD. Zaplanuj zarządzanie credentials (Docker secrets, nie env vars w plaintext).
+- **DNS** — kontener musi resolwować nazwy domenowe (np. `dc01.firma.local`). Skonfiguruj Docker DNS.
+- **Dane użytkownika muszą być PEŁNE** — sam login nie wystarczy. Potrzebne: imię, nazwisko, email, role, department. Zaplanuj skąd je pobrać (AD/LDAP query najczęściej w on-premise).
+- **Spójność z Angular + API** — MVC app powinna używać tego samego mechanizmu auth / IdP. Użytkownik nie powinien logować się dwa razy (SSO).
+- **Security first** — nie ufaj headerom bez trusted proxy (IP whitelist), wymuszaj HTTPS nawet on-premise, zabezpiecz cookies, obsłuż CSRF, używaj LDAPS zamiast LDAP.
+- **Fallback** — co jeśli AD/LDAP niedostępne? Cache? Minimalne dane z claims? Strona błędu?
+- **Konfiguracja przez env vars / secrets** — wrażliwe dane (service account password, LDAP bind password) NIGDY w appsettings.json w WARSTWIE obrazu Docker. Używaj Docker secrets.
+- **PoC przed implementacją** — najpierw udowodnij że:
+  1. Kontener ma connectivity do AD/LDAP
+  2. LDAP query zwraca dane użytkownika z kontenera Linux
+  3. Wybrany mechanizm auth działa w kontenerze
+- Dostosowanie do dostarczonego stacku technologicznego.
+- Postępuj zgodnie z podanymi zasadami implementacji.
+
+Końcowym wynikiem powinien być dobrze zorganizowany plan w formacie markdown.
+
+Pamiętaj, aby zapisać swój plan w pliku {{FILE}}. Upewnij się, że plan jest szczegółowy, przejrzysty i zapewnia kompleksowe wskazówki dla zespołu programistów.
