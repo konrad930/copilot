@@ -1,0 +1,380 @@
+# Analiza zmiany źródła danych placówek banku w aplikacji MVC (.NET Framework 4.8)
+
+Jesteś doświadczonym architektem oprogramowania specjalizującym się w systemach bankowych. Twoim zadaniem jest przeanalizować istniejącą aplikację ASP.NET MVC 5 (.NET Framework 4.8) pod kątem zmiany źródła danych placówek/oddziałów banku — z obecnej tabeli/struktury na NOWĄ tabelę z nową strukturą danych.
+
+## Kluczowe problemy
+
+1. **Podwójne źródło danych** — stare i nowe muszą współistnieć:
+   - Nowe dyspozycje → NOWE źródło danych placówek
+   - Stare dyspozycje (wystawione przed migracją) → STARE źródło, bez regresji
+
+2. **Brak kontekstu w serwisie placówek** — serwis odpowiedzialny za oddziały nie wie kiedy dyspozycja została wystawiona, więc nie wie z którego źródła pobierać dane
+
+3. **Różne widoki Razor** — stare i nowe dyspozycje mają RÓŻNE pola. Nowa struktura placówek wprowadza inne pola — niektóre stare pola znikają, pojawiają się nowe. Widoki muszą się dynamicznie dostosowywać
+
+NIE generuj gotowego planu wdrożenia. Przeanalizuj kod, zrozum architekturę, zidentyfikuj wszystkie punkty użycia danych placówek i zaproponuj strategię rozwiązania.
+
+## Co przeanalizować
+
+### 1. Zrozum obecny model danych placówek / oddziałów
+
+**Obecna tabela/encja placówek (STARE źródło):**
+- Jaka encja / klasa? Jakie właściwości?
+- Jakie dane (kod oddziału, nazwa, adres, typ, status, region, ...)?
+- Jak identyfikowana (ID, kod, symbol)?
+
+**Nowa tabela/encja placówek (NOWE źródło):**
+- Jaka encja / klasa? Jakie właściwości?
+- Co się ZMIENIŁO vs stara struktura?
+- Jakie pola ZNIKNĘŁY ze starej struktury?
+- Jakie NOWE pola się pojawiły?
+- Czy kody/ID placówek się zmieniły? Czy jest mapowanie stare → nowe?
+- Czy zmieniła się hierarchia (np. region → oddział → punkt vs oddział → filia)?
+
+**Relacja dyspozycja → placówka:**
+- Jak dyspozycja jest powiązana z placówką? (FK? Kod jako string? ID?)
+- Czy dyspozycja PRZECHOWUJE dane placówki (snapshot: nazwa, adres) czy tylko referencję (ID/kod) i pobiera dynamicznie?
+- Jeśli snapshot → problem mniejszy. Jeśli dynamicznie → serwis musi wiedzieć z którego źródła
+
+<db_entities>
+{{oldBranchEntity}} <- obecna encja / klasa placówki (stare źródło)
+{{newBranchEntity}} <- nowa encja / klasa placówki (nowe źródło)
+{{dispositionEntity}} <- encja / klasa dyspozycji — SZUKAJ pola z kodem/ID oddziału i daty
+{{mappingEntity}} <- mapowanie stare kody → nowe kody (jeśli istnieje)
+</db_entities>
+
+### 2. Znajdź serwis oddziałów / placówek — SEDNO PROBLEMU
+
+To jest KLUCZOWY element. Znajdź serwis odpowiedzialny za placówki i zrozum go dogłębnie:
+
+- Jak się nazywa? (`BranchService`, `OddzialService`, `PlacowkaService`, `UnitService`, ...?)
+- Jakie metody wystawia? (`GetById`, `GetByCode`, `GetAll`, `Search`, `GetForDropdown`, ...?)
+- Jakie parametry przyjmuje? (tylko `id`/`code`? Czy coś więcej?)
+- **CZY MA JAKIKOLWIEK PARAMETR KONTEKSTU CZASOWEGO?** (data? wersja? → prawdopodobnie NIE)
+- Skąd pobiera dane? (EF6 DbContext? ADO.NET? Stored procedure? Cache?)
+- Kto go wywołuje? (które kontrolery, które serwisy?)
+- Jak zarejestrowany w Ninject? (Singleton? Scoped? Transient?)
+- Czy cachuje dane? Jak?
+
+**Pokaż KONKRETNY call stack problemu, np.:**
+```
+DispositionController.Details(int id)
+    → _dispositionService.GetById(id)       // ← TU jest data dyspozycji
+        → _branchService.GetByCode("WA01")  // ← TU NIE MA daty — skąd wie które źródło?
+```
+
+Wskaż dokładnie GDZIE w łańcuchu wywołań gubi się kontekst.
+
+<branch_service>
+{{branchServiceFile}} <- serwis oddziałów / placówek
+{{branchServiceInterface}} <- interfejs serwisu (IBranchService itp.)
+{{branchRepository}} <- repozytorium / warstwa danych placówek (jeśli osobne)
+{{branchModel}} <- model / DTO placówki
+{{branchCaching}} <- logika cachowania (jeśli istnieje)
+</branch_service>
+
+### 3. Znajdź WSZYSTKIE miejsca użycia danych placówek w kodzie C#
+
+Przeszukaj CAŁY projekt. Dla KAŻDEGO znalezionego miejsca ustal:
+- **Kto woła** (kontroler? serwis? helper?)
+- **W jakim kontekście** (tworzenie dyspozycji? Wyświetlanie? Edycja? Lista? Raport?)
+- **Czy w tym miejscu jest dostęp do daty dyspozycji?** (TAK / NIE / NIE DOTYCZY)
+- **Które źródło powinno być użyte?** (stare / nowe / zależy od dyspozycji / zawsze nowe)
+
+**W kontrolerach:**
+- Które kontrolery wołają serwis placówek?
+- Czy mają dostęp do obiektu dyspozycji (a więc i daty) w momencie wywołania?
+
+**W serwisach biznesowych:**
+- Które serwisy wołają serwis placówek?
+- Czy serwis biznesowy MA obiekt dyspozycji kiedy woła serwis placówek?
+
+**W ViewModelach:**
+- Które ViewModele zawierają dane placówek?
+- Jak są budowane (w kontrolerze? W serwisie? Automapper?)
+
+<usage_points>
+{{controllers}} <- kontrolery używające danych placówek
+{{businessServices}} <- serwisy biznesowe (DispositionService, CaseService itp.)
+{{viewModels}} <- ViewModele zawierające dane placówek
+{{helpers}} <- helpery / utility classes używające danych placówek
+</usage_points>
+
+### 4. Przeanalizuj widoki Razor — RÓŻNE DLA STARYCH I NOWYCH
+
+To jest DRUGI kluczowy problem. Widoki muszą się różnić w zależności od tego czy dyspozycja jest stara czy nowa:
+
+**Zbadaj obecne widoki:**
+- Które widoki (.cshtml) wyświetlają dane placówek?
+- Jakie pola placówki są wyświetlane? (kod, nazwa, adres, typ, region, ...?)
+- Jak są wyświetlane? (`@Html.DisplayFor`? `@Html.EditorFor`? Tabela? Szczegóły? Dropdown?)
+- Czy są partial views dla sekcji z danymi placówki?
+
+**Zidentyfikuj RÓŻNICE między starą a nową strukturą na poziomie UI:**
+
+| Pole | Stara dyspozycja (stare źródło) | Nowa dyspozycja (nowe źródło) | Zmiana |
+|---|---|---|---|
+| [pole1] | Wyświetlane | Wyświetlane (bez zmian) | Brak |
+| [pole2] | Wyświetlane | USUNIĘTE — nie istnieje w nowej strukturze | Znika |
+| [pole3] | Nie istniało | NOWE — pojawia się w nowej strukturze | Nowe pole |
+| [pole4] | Wyświetlane jako X | Wyświetlane jako Y (inna semantyka/format) | Zmienione |
+
+**Rozważ strategię różnicowania widoków:**
+
+**Strategia V1: Jeden widok z if/else**
+```html
+@if (Model.IsLegacyDisposition)
+{
+    <!-- stare pola placówki -->
+    @Html.DisplayFor(m => m.Branch.OldField1)
+    @Html.DisplayFor(m => m.Branch.OldField2)
+}
+else
+{
+    <!-- nowe pola placówki -->
+    @Html.DisplayFor(m => m.Branch.NewField1)
+    @Html.DisplayFor(m => m.Branch.NewField3)
+}
+```
+- Zaleta: jeden plik
+- Wada: widok staje się zagmatwany, trudny do utrzymania
+
+**Strategia V2: Osobne partial views**
+```html
+<!-- Details.cshtml -->
+@if (Model.IsLegacyDisposition)
+{
+    @Html.Partial("_BranchDetailsLegacy", Model.LegacyBranch)
+}
+else
+{
+    @Html.Partial("_BranchDetailsNew", Model.NewBranch)
+}
+```
+- Zaleta: czyste, łatwe do utrzymania, osobne ViewModele
+- Wada: więcej plików
+
+**Strategia V3: EditorTemplate / DisplayTemplate per typ**
+```csharp
+// ViewModel:
+public LegacyBranchViewModel LegacyBranch { get; set; }  // stary typ
+public NewBranchViewModel NewBranch { get; set; }          // nowy typ
+
+// Razor automatycznie dobierze odpowiedni DisplayTemplate:
+@Html.DisplayFor(m => m.Branch) // → DisplayTemplates/LegacyBranchViewModel.cshtml
+                                //    LUB DisplayTemplates/NewBranchViewModel.cshtml
+```
+- Zaleta: MVC sam dobiera template na podstawie typu
+- Wada: wymaga polimorfizmu w ViewModelu
+
+**Strategia V4: Osobne akcje kontrolera / widoki**
+```csharp
+// Dwa widoki — stary i nowy:
+if (disposition.IsLegacy)
+    return View("DetailsLegacy", legacyViewModel);
+else
+    return View("Details", newViewModel);
+```
+- Zaleta: pełna separacja
+- Wada: duplikacja widoków (części wspólne)
+
+Oceń KAŻDĄ strategię w kontekście obecnego kodu — ile widoków trzeba zmienić, jak duża jest różnica między starymi a nowymi polami, czy są wspólne elementy.
+
+**Formularze (tworzenie / edycja):**
+- Dropdown z listą placówek — skąd dane?
+  - Tworzenie nowej dyspozycji → NOWE źródło (zawsze)
+  - Edycja starej dyspozycji → ??? (stare źródło? nowe? mix?)
+- Autocomplete / search placówek — analogiczny problem
+
+<views>
+{{dispositionViews}} <- widoki dyspozycji: Create, Edit, Details, Index (lista)
+{{branchPartialViews}} <- partial views z danymi placówek
+{{branchDropdowns}} <- widoki z dropdownem / autocomplete placówek
+{{editorTemplates}} <- EditorTemplates / DisplayTemplates (jeśli istnieją)
+{{layoutFile}} <- _Layout.cshtml (jeśli dane placówki są w layoucie)
+</views>
+
+### 5. Przeanalizuj ViewModele — jak przekazują dane placówek do widoków
+
+**Zbadaj obecne ViewModele:**
+- Które ViewModele zawierają dane placówki?
+- Jak wyglądają? (flat properties? Nested object `BranchViewModel`? Raw entity?)
+- Czy jest jeden ViewModel dla Details / Edit / Create, czy osobne?
+- Czy ViewModel zawiera `SelectList` / `IEnumerable<SelectListItem>` dla dropdownu placówek?
+
+**Zaprojektuj jak ViewModele powinny wyglądać po zmianie:**
+- Czy potrzebne są OSOBNE ViewModele dla starych i nowych dyspozycji?
+- Czy jeden ViewModel z flagą `IsLegacy` + nullable fields dla obu wariantów?
+- Czy bazowy ViewModel + dziedziczenie (Legacy / New)?
+- Jak ViewModel będzie wiedział czy dyspozycja jest stara czy nowa?
+- Jak ViewModel dla formularza tworzenia wie żeby wyświetlić dropdown z NOWEGO źródła?
+- Jak ViewModel dla formularza edycji starej dyspozycji wie żeby wyświetlić dropdown ze STAREGO?
+
+<view_models>
+{{dispositionViewModels}} <- ViewModele dyspozycji
+{{branchViewModels}} <- ViewModele placówek (jeśli osobne)
+{{formViewModels}} <- ViewModele formularzy (Create/Edit) z SelectList dla dropdownu
+</view_models>
+
+### 6. Przeanalizuj problem braku kontekstu — SEDNO
+
+Serwis placówek nie wie z którego źródła pobierać. Przeanalizuj i oceń strategie:
+
+**Strategia A: Rozszerzenie interfejsu o kontekst**
+```csharp
+// PRZED:
+IBranchService.GetByCode(string code);
+// PO:
+IBranchService.GetByCode(string code, BranchDataSource source);
+// enum BranchDataSource { Legacy, New }
+```
+- Caller decyduje i JAWNIE mówi skąd pobrać
+- Ile callerów trzeba zmienić? Czy każdy MA informację do podjęcia decyzji?
+
+**Strategia B: Logika decyzji w callerze (serwis biznesowy)**
+```csharp
+// DispositionService:
+var branch = disposition.CreatedDate < _cutoffDate
+    ? _branchService.GetFromLegacy(code)
+    : _branchService.GetFromNew(code);
+```
+- Serwis biznesowy MA kontekst (datę), on decyduje
+- Serwis placówek dostaje dwie metody / dwa źródła
+
+**Strategia C: Flaga w dyspozycji**
+```csharp
+// Nowe pole w encji:
+public string BranchDataSource { get; set; } // "LEGACY" | "NEW"
+// Stare dyspozycje: migracja → ustaw "LEGACY"
+// Nowe: domyślnie "NEW"
+// Caller przekazuje flagę do serwisu placówek
+```
+- Jawne, nie zależy od daty cutoff
+- Wymaga zmiany schematu + migracja danych
+
+**Strategia D: Snapshot w dyspozycji**
+```csharp
+// Zapisz snapshot danych placówki w dyspozycji:
+disposition.BranchCode = "WA01";
+disposition.BranchName = "Oddział Warszawa";   // snapshot
+disposition.BranchAddress = "ul. Marszałkowska 1"; // snapshot
+// Wyświetlanie: bierz z dyspozycji, nie z serwisu
+```
+- Eliminuje problem dynamicznego pobierania
+- Stare dyspozycje wymagają jednorazowego uzupełnienia
+
+**Strategia E: Unified service z fallback**
+```csharp
+class UnifiedBranchService : IBranchService
+{
+    GetByCode(string code)
+    {
+        var branch = _newRepo.Find(code);
+        if (branch == null)
+            branch = _legacyRepo.Find(code);
+        return branch;
+    }
+}
+```
+- Zero zmian w callerach
+- Ale: co jeśli ten sam kod istnieje w OBU źródłach z INNYMI danymi?
+
+**Strategia F: Ambient context (scoped)**
+```csharp
+// Scoped service ustawiany wcześniej w pipeline:
+public class BranchSourceContext
+{
+    public BranchDataSource Source { get; set; } = BranchDataSource.New;
+}
+// Middleware / action filter / serwis biznesowy ustawia:
+_branchSourceContext.Source = disposition.IsLegacy ? Legacy : New;
+// Serwis placówek czyta context bez zmiany sygnatury
+```
+- Brak zmian w sygnaturze
+- Implicit state — ryzyko błędów
+
+Dla KAŻDEJ strategii oceń:
+- Ile zmian w kodzie C# wymaga?
+- Czy wymaga zmiany interfejsu `IBranchService` (breaking change)?
+- Jak wpływa na ViewModele i widoki?
+- Jak radzi sobie z edge case'ami?
+- Jak współgra ze strategią widoków (V1-V4)?
+
+### 7. Zidentyfikuj scenariusze i edge case'y
+
+Dla KAŻDEGO scenariusza ustal: skąd źródło danych? Czy kontekst dostępny? Jak widok się różni?
+
+| Scenariusz | Źródło placówki | Kontekst dostępny? | Widok różni się? | Problem |
+|---|---|---|---|---|
+| Tworzenie nowej dyspozycji | NOWE (zawsze) | NIE DOTYCZY | TAK — nowe pola | Dropdown z nowej tabeli, nowe pola formularza |
+| Wyświetlanie starej dyspozycji | STARE | TAK (data w dyspozycji) | TAK — stare pola | Serwis musi wiedzieć → skąd? Widok musi wyświetlić stare pola |
+| Wyświetlanie nowej dyspozycji | NOWE | TAK | TAK — nowe pola | OK jeśli serwis wie |
+| Edycja starej dyspozycji | ??? | TAK | TAK — stare pola | Czy zmiana placówki → nowe źródło? Czy zostawić stare? |
+| Lista dyspozycji (Index) | MIX | TAK (per wiersz) | TAK — kolumny mogą się różnić | Mix starych i nowych w jednej tabeli — jakie kolumny? |
+| Kopiowanie starej → nowa | NOWE (kopia = nowa) | TAK (źródło) | TAK — nowe pola w kopii | Kopia powinna dostać nowe źródło + nowy formularz |
+| Podgląd wydruku / PDF | Zależy od dyspozycji | TAK | TAK | Różne dane na wydruku |
+
+**Edge case'y:**
+- Dyspozycja wystawiona W DNIU migracji (cutoff) — stara czy nowa?
+- Stary kod placówki nie istnieje w nowej tabeli — co wyświetlić?
+- Nowy kod placówki nie istnieje w starej tabeli — oczywiste, ale co jeśli edycja starej dyspozycji?
+- Cache placówek — jeśli serwis cachuje, cache musi uwzględniać podwójne źródło
+- Walidacja — czy stara placówka zamknięta w nowym źródle blokuje starą dyspozycję?
+
+### 8. Oceń impact na istniejący kod
+
+Stwórz tabelę impactu — dla KAŻDEGO znalezionego pliku:
+
+| Plik | Klasa / Metoda | Co robi z placówkami | Kontekst daty dostępny? | Zmiana widoku potrzebna? | Strategia | Nakład | Ryzyko |
+|---|---|---|---|---|---|---|---|
+| [plik] | [metoda] | [opis] | TAK/NIE | TAK/NIE | [A-F] + [V1-V4] | S/M/L | Low/Med/High |
+
+## Pliki projektu
+
+<project_files>
+{{webConfig}}
+{{ninjectConfig}} <- NinjectWebCommon.cs / moduły DI
+{{dbContext}} <- DbContext (EF6)
+{{csprojFile}}
+</project_files>
+
+Tech stack:
+<tech_stack>
+tech-stack.md
+</tech_stack>
+
+Zasady implementacji:
+<implementation_rules>
+implementation-rules.md
+</implementation_rules>
+
+## Oczekiwany output
+
+Po analizie kodu przedstaw:
+
+1. **Mapa przepływu danych placówek** — jak dziś dane płyną od encji przez serwis, ViewModel do widoku Razor. Wskaż KONKRETNE pliki, klasy, metody
+
+2. **Lista WSZYSTKICH miejsc użycia** — tabela z każdym plikiem C# i widokiem Razor który dotyka danych placówek
+
+3. **Analiza problemu kontekstu** — pokaż DOKŁADNIE gdzie w call stacku gubi się informacja. Wskaż konkretne wywołania: "w pliku X, linia Y, metoda Z woła serwis placówek ale nie przekazuje daty"
+
+4. **Różnice w polach stary vs nowy** — tabela: które pola znikają, które się pojawiają, które się zmieniają. Jak to wpływa na każdy widok Razor
+
+5. **Rekomendacja strategii** — JEDNA strategia dla serwisu (A-F) + JEDNA dla widoków (V1-V4), uzasadnienie, jak współgrają ze sobą, ile zmian wymaga, edge case'y
+
+6. **Rekomendacja struktury ViewModeli** — jak powinny wyglądać ViewModele żeby obsłużyć oba warianty (stary/nowy) i przekazać widokowi informację który wariant wyświetlić
+
+7. **Lista ryzyk i edge case'ów** z propozycją jak je obsłużyć
+
+## Zasady
+
+- **Najpierw analizuj, potem proponuj** — zrozum kod zanim zaproponujesz rozwiązanie
+- **Wskazuj konkretne pliki, klasy, metody** — nie mów ogólnikami
+- **Problem kontekstu jest kluczowy** — skup się na nim, pokaż dokładnie gdzie się gubi
+- **Widoki MUSZĄ się różnić** — stare pola dla starych dyspozycji, nowe dla nowych. Zaproponuj czystą strategię
+- **Backward compatibility jest krytyczna** — stare dyspozycje MUSZĄ wyglądać i działać jak przed migracją
+- **Bądź pragmatyczny** — szukaj rozwiązania które wymaga najmniej zmian a daje największe bezpieczeństwo
+- **Nie skupiaj się na SQL** — analizuj kod C# (serwisy, kontrolery, ViewModele, widoki Razor)
+- **Pamiętaj o cache** — jeśli serwis cachuje placówki, cache musi uwzględniać podwójne źródło
+- **Pamiętaj o dropdownach** — formularze z wyborem placówki muszą wiedzieć z którego źródła brać listę
+- **.NET Framework 4.8 / MVC 5** — rozwiązanie musi działać w tym stacku
